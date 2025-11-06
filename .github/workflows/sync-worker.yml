@@ -1,0 +1,106 @@
+name: Build Obfuscate BPB Panel
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 1 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      # 删除缓存步骤（因为项目没有 package-lock.json）
+      # 删除 npm 缓存相关步骤
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "latest"
+          # 移除 cache 参数
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq > /dev/null
+          sudo apt-get install -y jq > /dev/null
+
+      - name: Fetch and download latest worker.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          
+          echo "Fetching releases..."
+          RELEASES_JSON=$(curl -sSL \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases?per_page=20")
+
+          # 按发布时间排序，获取第一个非草稿的发布
+          RELEASE=$(echo "$RELEASES_JSON" | jq -c 'map(select(.draft == false)) | 
+                   sort_by(.published_at) | reverse | .[0]')
+
+          if [ -z "$RELEASE" ] || [ "$RELEASE" = "null" ]; then
+            echo "::error::No suitable release found"
+            exit 1
+          fi
+
+          TAG_NAME=$(echo "$RELEASE" | jq -r '.tag_name')
+          PUBLISHED_AT=$(echo "$RELEASE" | jq -r '.published_at')
+          PRERELEASE_STATUS=$(echo "$RELEASE" | jq -r '.prerelease')
+          echo "Found latest release: $TAG_NAME (published: $PUBLISHED_AT)"
+          echo "Pre-release: $PRERELEASE_STATUS"
+
+          # 将 TAG_NAME 设置为环境变量（用于提交消息）
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
+
+          # 更灵活的资源匹配逻辑
+          ASSET_URL=$(echo "$RELEASE" | jq -r '.assets[] | 
+                     select(.name | test("^worker(\\.min)?\\.js$"; "i")) | 
+                     .browser_download_url' | head -1)
+
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "::error::No worker.js or worker.min.js file found in release assets"
+            echo "Available assets:"
+            echo "$RELEASE" | jq -r '.assets[].name'
+            exit 1
+          fi
+
+          # 下载文件
+          echo "Downloading $ASSET_URL to _worker.js"
+          wget -qO _worker.js.tmp "$ASSET_URL" || {
+            echo "::error::Failed to download $ASSET_URL"
+            exit 1
+          }
+
+          # 验证文件非空
+          if ! [ -s "_worker.js.tmp" ]; then
+            echo "::error::Downloaded file is empty"
+            exit 1
+          fi
+
+          mv _worker.js.tmp _worker.js
+          echo "✅ Successfully updated worker.js"
+          
+          FILE_SIZE=$(stat -c%s _worker.js 2>/dev/null || wc -c < _worker.js)
+          echo "File size: $((FILE_SIZE / 1024)) KB"
+          echo "---- First 5 lines ----"
+          head -n 5 _worker.js || true
+          echo "-----------------------"
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: ':arrow_up: Update BPB panel worker.js from release ${{ env.TAG_NAME }}'
+          commit_author: 'github-actions[bot] <github-actions[bot]@users.noreply.github.com>'
+          file_pattern: _worker.js
+          skip_dirty_check: true
