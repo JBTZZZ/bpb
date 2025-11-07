@@ -5,10 +5,11 @@ on:
     branches:
       - main
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "0 1 * * *" # 每天 UTC 时间 01:00 运行
+  workflow_dispatch: # 允许手动触发以进行测试
 
 permissions:
-  contents: write
+  contents: write # 授予推送提交的写入权限
 
 jobs:
   build:
@@ -17,15 +18,15 @@ jobs:
     steps:
       - name: Check out the code
         uses: actions/checkout@v4
-
-      # 删除缓存步骤（因为项目没有 package-lock.json）
-      # 删除 npm 缓存相关步骤
+        with:
+          # 重要：fetch-depth: 0 对于 git-auto-commit-action 至关重要
+          # 以便在推送到同一分支时正确工作，因为它需要完整的历史记录来创建新提交并推送。
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "latest"
-          # 移除 cache 参数
 
       - name: Install system dependencies
         run: |
@@ -33,24 +34,25 @@ jobs:
           sudo apt-get install -y jq > /dev/null
 
       - name: Fetch and download latest worker.js
+        id: fetch_worker # 为此步骤添加 ID，以便在需要时引用其输出
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           
-          echo "Fetching releases..."
+          echo "Fetching releases from bia-pain-bache/BPB-Worker-Panel..."
           RELEASES_JSON=$(curl -sSL \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases?per_page=20")
 
-          # 按发布时间排序，获取第一个非草稿的发布
+          # 过滤非草稿版本，按 published_at 排序（最新优先），并取第一个
           RELEASE=$(echo "$RELEASES_JSON" | jq -c 'map(select(.draft == false)) | 
                    sort_by(.published_at) | reverse | .[0]')
 
           if [ -z "$RELEASE" ] || [ "$RELEASE" = "null" ]; then
-            echo "::error::No suitable release found"
+            echo "::error::No suitable release found."
             exit 1
           fi
 
@@ -60,47 +62,69 @@ jobs:
           echo "Found latest release: $TAG_NAME (published: $PUBLISHED_AT)"
           echo "Pre-release: $PRERELEASE_STATUS"
 
-          # 将 TAG_NAME 设置为环境变量（用于提交消息）
-          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
+          # 将 TAG_NAME 导出为环境变量，用于提交消息
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
 
-          # 更灵活的资源匹配逻辑
+          # 匹配名为 'worker.js' 或 'worker.min.js' 的资产（不区分大小写）
           ASSET_URL=$(echo "$RELEASE" | jq -r '.assets[] | 
                      select(.name | test("^worker(\\.min)?\\.js$"; "i")) | 
-                     .browser_download_url' | head -1)
+                     .browser_download_url' | head -1) # 使用 head -1 来选择第一个匹配项，如果有多个
 
           if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-            echo "::error::No worker.js or worker.min.js file found in release assets"
+            echo "::error::No 'worker.js' or 'worker.min.js' file found in release assets for tag '$TAG_NAME'."
             echo "Available assets:"
             echo "$RELEASE" | jq -r '.assets[].name'
             exit 1
           fi
 
-          # 下载文件
-          echo "Downloading $ASSET_URL to _worker.js"
+          # 先下载文件到临时名称
+          echo "Downloading $ASSET_URL to _worker.js.tmp"
           wget -qO _worker.js.tmp "$ASSET_URL" || {
-            echo "::error::Failed to download $ASSET_URL"
+            echo "::error::Failed to download $ASSET_URL."
             exit 1
           }
 
-          # 验证文件非空
+          # 验证下载的文件不为空
           if ! [ -s "_worker.js.tmp" ]; then
-            echo "::error::Downloaded file is empty"
+            echo "::error::Downloaded file is empty."
             exit 1
           fi
 
+          # 将临时文件移动到最终位置
           mv _worker.js.tmp _worker.js
-          echo "✅ Successfully updated worker.js"
+          echo "✅ Successfully downloaded _worker.js"
           
+          # 提供一些关于下载文件的信息
           FILE_SIZE=$(stat -c%s _worker.js 2>/dev/null || wc -c < _worker.js)
           echo "File size: $((FILE_SIZE / 1024)) KB"
           echo "---- First 5 lines ----"
           head -n 5 _worker.js || true
           echo "-----------------------"
 
-      - name: Commit and push changes
+      - name: Check for changes to _worker.js
+        id: check_changes
+        run: |
+          # 使用 git diff --exit-code --quiet 检查 _worker.js 是否相对于其提交版本发生了变化
+          # 退出码 0 表示无差异，1 表示有差异。
+          if git diff --exit-code --quiet _worker.js; then
+            echo "::notice::No changes detected for _worker.js. Skipping commit."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Changes detected for _worker.js. Proceeding with commit."
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Auto commit and push changes
+        # 此步骤仅在 'check_changes' 步骤检测到实际修改时运行
+        if: steps.check_changes.outputs.has_changes == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: ':arrow_up: Update BPB panel worker.js from release ${{ env.TAG_NAME }}'
-          commit_author: 'github-actions[bot] <github-actions[bot]@users.noreply.github.com>'
-          file_pattern: _worker.js
-          skip_dirty_check: true
+          repository: .
+          file_pattern: _worker.js # 仅提交此特定文件
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          # 使用先前设置的环境变量 TAG_NAME
+          commit_message: ":arrow_up: Update BPB panel worker.js from release ${{ env.TAG_NAME }}"
+          # 重要：移除 'skip_dirty_check: true'
+          # 现在条件 `if` 语句处理脏检查。
+          # branch: main # 可选：仅在你想提交到不同于当前的分支时需要
